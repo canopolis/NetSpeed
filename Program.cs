@@ -129,7 +129,7 @@ namespace NetSpeed
     class PingState
     {
         public bool Online;
-        public double PingMs, JitterMs;
+        public double PingMs, JitterMs, Baseline;
     }
 
     class SpeedResult
@@ -154,12 +154,15 @@ namespace NetSpeed
         int burstFails, offline;
         public double LastPing = 30;
         public double KnownDown, KnownUp;          // last results, used to size the next test without a probe
+        public double Baseline;                    // this connection's normal ping (learned)
+        readonly List<double> longHist = new List<double>();
+        const double UpTargetSeconds = 0.35;       // upload measured a bit longer for accuracy
 
         public Network()
         {
             ServicePointManager.SecurityProtocol = SecurityProtocolType.Tls12 | (SecurityProtocolType)12288;
             http = new HttpClient { Timeout = TimeSpan.FromSeconds(20) };
-            http.DefaultRequestHeaders.UserAgent.ParseAdd("NetSpeed/3.3");
+            http.DefaultRequestHeaders.UserAgent.ParseAdd("NetSpeed/3.4");
             http.DefaultRequestHeaders.CacheControl = new System.Net.Http.Headers.CacheControlHeaderValue { NoCache = true, NoStore = true };
         }
 
@@ -246,6 +249,7 @@ namespace NetSpeed
                 st.Online = offline < 2;     // two failed bursts in a row (about 20 s) = offline
                 st.PingMs = LastPing;
                 st.JitterMs = histJ.Count > 0 ? histJ.Average() : 0;
+                st.Baseline = Baseline;
                 return st;
             }
             offline = 0;
@@ -265,6 +269,19 @@ namespace NetSpeed
             while (histP.Count > 3) histP.RemoveAt(0);
             while (histJ.Count > 3) histJ.RemoveAt(0);
             LastPing = histP.Average();
+
+            // Normal ping = low value seen over the last hour (20th percentile of burst medians).
+            longHist.Add(med);
+            while (longHist.Count > 360) longHist.RemoveAt(0);
+            if (longHist.Count >= 6)
+            {
+                var ls = longHist.OrderBy(x => x).ToList();
+                Baseline = ls[(int)(ls.Count * 0.2)];
+                if (longHist.Count % 30 == 0)
+                    Settings.Set("BaselinePing", Baseline.ToString("0.0", System.Globalization.CultureInfo.InvariantCulture));
+            }
+            else if (Baseline <= 0) Baseline = med;
+            st.Baseline = Baseline;
             st.Online = true;
             st.PingMs = LastPing;
             st.JitterMs = histJ.Average();
@@ -312,14 +329,14 @@ namespace NetSpeed
             sw.Stop();
             DataUse.Add(size);
             double ms = sw.Elapsed.TotalMilliseconds;
-            double eff = Math.Max(ms - LastPing, ms * 0.5);
+            double eff = Math.Max(ms - LastPing / 2, ms * 0.7);
             return size * 8 / (eff / 1000) / 1e6;
         }
 
-        static int SizeFor(double mbps)
+        static int SizeFor(double mbps, double seconds = TargetSeconds)
         {
             if (mbps <= 0) return 1000000;
-            double b = mbps * 1e6 / 8 * TargetSeconds;
+            double b = mbps * 1e6 / 8 * seconds;
             return (int)Math.Min(MaxB, Math.Max(MinB, b));
         }
 
@@ -335,7 +352,7 @@ namespace NetSpeed
                 double down = Download(SizeFor(downEst), out moved);
                 if (down <= 0) down = downEst;
                 double upEst = KnownUp > 0 ? KnownUp : Upload(MinB);
-                double up = Upload(SizeFor(upEst));
+                double up = Upload(SizeFor(upEst, UpTargetSeconds));
                 if (down > 0) KnownDown = down;
                 if (up > 0) KnownUp = up;
                 r.DownMbps = down;
@@ -375,6 +392,9 @@ namespace NetSpeed
             if (Startup.Enabled) Startup.Set(true);
             lastSpeed = LoadLastSpeed();
             if (lastSpeed != null && lastSpeed.Ok) { net.KnownDown = lastSpeed.DownMbps; net.KnownUp = lastSpeed.UpMbps; }
+            double bp;
+            if (double.TryParse(Settings.Get("BaselinePing", ""), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out bp) && bp > 0)
+                net.Baseline = bp;
 
             lineSpeed = new ToolStripMenuItem("Speed: not measured yet") { Enabled = false };
             linePing = new ToolStripMenuItem("Ping: measuring…") { Enabled = false };
@@ -531,11 +551,16 @@ namespace NetSpeed
 
         // ---------- display ----------
 
+        double Normal() => lastPing.Baseline > 0 ? lastPing.Baseline : lastPing.PingMs;
+        double Above() => Math.Max(0, lastPing.PingMs - Normal());
+
+        // Green: ping within 30 ms of this connection's normal and jitter under 10 ms.
+        // Orange: ping 30-60 ms above normal or jitter 10-30 ms. Red: more than that, or offline.
         int Level()
         {
             if (!lastPing.Online) return 2;
-            if (lastPing.PingMs > 100 || lastPing.JitterMs > 10) return 2;
-            if (lastPing.PingMs >= 50 || lastPing.JitterMs >= 5) return 1;
+            if (Above() > 60 || lastPing.JitterMs > 30) return 2;
+            if (Above() > 30 || lastPing.JitterMs >= 10) return 1;
             return 0;
         }
 
@@ -544,10 +569,10 @@ namespace NetSpeed
         string Reason()
         {
             if (!lastPing.Online) return "offline";
-            if (lastPing.PingMs > 100) return "high ping";
-            if (lastPing.JitterMs > 10) return "high jitter";
-            if (lastPing.PingMs >= 50) return "ping above 50 ms";
-            if (lastPing.JitterMs >= 5) return "jitter above 5 ms";
+            if (Above() > 60) return "ping " + Above().ToString("0") + " ms above normal";
+            if (lastPing.JitterMs > 30) return "high jitter";
+            if (Above() > 30) return "ping " + Above().ToString("0") + " ms above normal";
+            if (lastPing.JitterMs >= 10) return "jitter above 10 ms";
             return "ready for calls and games";
         }
 
@@ -569,7 +594,7 @@ namespace NetSpeed
         }
 
         string PingText() => lastPing.Online
-            ? "Ping " + lastPing.PingMs.ToString("0") + " ms · Jitter " + lastPing.JitterMs.ToString("0") + " ms"
+            ? "Ping " + lastPing.PingMs.ToString("0") + " ms (normal " + Normal().ToString("0") + ") · Jitter " + lastPing.JitterMs.ToString("0") + " ms"
             : "Offline";
 
         void UpdateMenuTexts()
@@ -735,7 +760,8 @@ namespace NetSpeed
 
             using (var g = CreateGraphics())
             {
-                var w = g.MeasureString("↓ 999.99  ↑ 999.99 MB/s  (00:00)", font).Width;
+                var w = Math.Max(g.MeasureString("↓ 999.99  ↑ 999.99 MB/s  (00:00)", font).Width,
+                                 g.MeasureString("Ping 999 ms (normal 999) · Jitter 99 ms", font).Width);
                 var h = g.MeasureString("Ag", font).Height;
                 var h3 = g.MeasureString("Ag", small).Height;
                 ClientSize = new Size((int)w + 18, (int)(h * 2 + h3) + 8);
