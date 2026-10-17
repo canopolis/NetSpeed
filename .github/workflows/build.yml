@@ -1,0 +1,49 @@
+name: Build NetSpeed
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Build NetSpeed.exe
+        run: dotnet build NetSpeed.csproj -c Release -o build
+
+      - name: Install Inno Setup
+        run: choco install innosetup -y --no-progress
+
+      - name: Build installer
+        shell: pwsh
+        run: |
+          $iscc = Get-ChildItem "C:\Program Files*\Inno Setup*\ISCC.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $iscc) { throw "ISCC.exe not found" }
+          & $iscc.FullName NetSpeed.iss
+          if ($LASTEXITCODE -ne 0) { throw "Installer build failed" }
+
+      - name: Add portable exe
+        shell: pwsh
+        run: Copy-Item build\NetSpeed.exe dist\NetSpeed_Portable.exe
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: NetSpeed
+          path: dist/*
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v1.0.${{ github.run_number }}
+          name: NetSpeed v1.0.${{ github.run_number }}
+          files: dist/*
