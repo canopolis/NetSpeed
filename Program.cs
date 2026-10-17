@@ -148,9 +148,10 @@ namespace NetSpeed
         const double TargetSeconds = 0.2;           // measured part of each transfer
         readonly HttpClient http;
         readonly Random rnd = new Random();
-        readonly List<double> recent = new List<double>();
-        bool icmpBlocked;
-        int fails;
+        readonly List<double> histP = new List<double>(), histJ = new List<double>();
+        bool httpMode;
+        DateTime httpSince;
+        int burstFails, offline;
         public double LastPing = 30;
         public double KnownDown, KnownUp;          // last results, used to size the next test without a probe
 
@@ -158,22 +159,11 @@ namespace NetSpeed
         {
             ServicePointManager.SecurityProtocol = SecurityProtocolType.Tls12 | (SecurityProtocolType)12288;
             http = new HttpClient { Timeout = TimeSpan.FromSeconds(20) };
-            http.DefaultRequestHeaders.UserAgent.ParseAdd("NetSpeed/3.2");
+            http.DefaultRequestHeaders.UserAgent.ParseAdd("NetSpeed/3.3");
             http.DefaultRequestHeaders.CacheControl = new System.Net.Http.Headers.CacheControlHeaderValue { NoCache = true, NoStore = true };
         }
 
         string R() => rnd.Next().ToString("x");
-
-        double IcmpPing()
-        {
-            using (var p = new Ping())
-            {
-                var reply = p.Send(PingHost, 2000);
-                DataUse.Add(120);
-                if (reply.Status != IPStatus.Success) throw new Exception("ping " + reply.Status);
-                return Math.Max(1, reply.RoundtripTime);
-            }
-        }
 
         double HttpPing()
         {
@@ -187,48 +177,98 @@ namespace NetSpeed
             return sw.Elapsed.TotalMilliseconds;
         }
 
-        public PingState PingOnce()
+        // Burst of 4 network pings 0.1 s apart: ping = middle value, jitter = variation inside the burst.
+        List<double> IcmpBurst()
         {
-            var st = new PingState();
-            double ms = -1;
-            if (!icmpBlocked)
+            var got = new List<double>();
+            using (var p = new Ping())
             {
-                try { ms = IcmpPing(); }
-                catch
+                for (int i = 0; i < 4; i++)
                 {
-                    // ICMP failed: check over the web. If the web works, ICMP is blocked on this network.
-                    try { ms = HttpPing(); icmpBlocked = true; } catch { ms = -1; }
+                    try
+                    {
+                        var reply = p.Send(PingHost, 1000);
+                        DataUse.Add(120);
+                        if (reply.Status == IPStatus.Success) got.Add(Math.Max(1, reply.RoundtripTime));
+                    }
+                    catch { }
+                    if (i < 3) Thread.Sleep(100);
                 }
+            }
+            return got;
+        }
+
+        // Web fallback, only used when the network blocks normal pings. First request only warms the connection.
+        List<double> HttpBurst()
+        {
+            var got = new List<double>();
+            for (int i = 0; i < 4; i++)
+            {
+                try { double ms = HttpPing(); if (i > 0) got.Add(ms); } catch { }
+                if (i < 3) Thread.Sleep(100);
+            }
+            return got;
+        }
+
+        public PingState Sample()
+        {
+            List<double> got;
+            if (!httpMode)
+            {
+                got = IcmpBurst();
+                if (got.Count == 0)
+                {
+                    burstFails++;
+                    if (burstFails >= 3)
+                    {
+                        var h = HttpBurst();
+                        if (h.Count > 0) { httpMode = true; httpSince = DateTime.Now; got = h; }
+                    }
+                }
+                else burstFails = 0;
             }
             else
             {
-                try { ms = HttpPing(); } catch { ms = -1; }
+                got = null;
+                if ((DateTime.Now - httpSince).TotalMinutes >= 5)   // check if normal pings work again
+                {
+                    httpSince = DateTime.Now;
+                    var test = IcmpBurst();
+                    if (test.Count > 0) { httpMode = false; burstFails = 0; got = test; }
+                }
+                if (got == null) got = HttpBurst();
             }
 
-            if (ms < 0)
+            var st = new PingState();
+            if (got.Count == 0)
             {
-                fails++;
-                st.Online = fails < 2;            // one lost packet is not "offline"
+                offline++;
+                st.Online = offline < 2;     // two failed bursts in a row (about 20 s) = offline
                 st.PingMs = LastPing;
-                st.JitterMs = Jitter();
+                st.JitterMs = histJ.Count > 0 ? histJ.Average() : 0;
                 return st;
             }
-            fails = 0;
-            LastPing = ms;
-            recent.Add(ms);
-            while (recent.Count > 10) recent.RemoveAt(0);
-            st.Online = true;
-            st.PingMs = ms;
-            st.JitterMs = Jitter();
-            return st;
-        }
+            offline = 0;
 
-        double Jitter()
-        {
-            if (recent.Count < 2) return 0;
-            double sum = 0;
-            for (int i = 1; i < recent.Count; i++) sum += Math.Abs(recent[i] - recent[i - 1]);
-            return sum / (recent.Count - 1);
+            var sorted = got.OrderBy(x => x).ToList();
+            double med = sorted.Count % 2 == 1 ? sorted[sorted.Count / 2]
+                       : (sorted[sorted.Count / 2 - 1] + sorted[sorted.Count / 2]) / 2;
+            double jit = 0;
+            if (got.Count >= 2)
+            {
+                for (int i = 1; i < got.Count; i++) jit += Math.Abs(got[i] - got[i - 1]);
+                jit /= got.Count - 1;
+            }
+
+            // Show the average of the last 3 bursts (30 s) so one stray value doesn't flip the colour.
+            histP.Add(med); histJ.Add(jit);
+            while (histP.Count > 3) histP.RemoveAt(0);
+            while (histJ.Count > 3) histJ.RemoveAt(0);
+            LastPing = histP.Average();
+            st.Online = true;
+            st.PingMs = LastPing;
+            st.JitterMs = histJ.Average();
+            return st;
         }
 
         // Download: the clock starts when the first data arrives, so ping does not lower the result.
@@ -310,7 +350,7 @@ namespace NetSpeed
 
     class TrayApp : ApplicationContext
     {
-        static readonly Color Green = Color.FromArgb(46, 125, 50), Orange = Color.FromArgb(230, 100, 0), Red = Color.FromArgb(198, 40, 40);
+        static readonly Color Green = Color.FromArgb(27, 110, 32), Orange = Color.FromArgb(190, 85, 0), Red = Color.FromArgb(183, 28, 28);
 
         readonly NotifyIcon tray = new NotifyIcon();
         readonly ContextMenuStrip menu = new ContextMenuStrip();
@@ -423,10 +463,10 @@ namespace NetSpeed
                 if (!testing)   // a running speed test would distort ping
                 {
                     PingState p;
-                    try { p = net.PingOnce(); } catch (Exception ex) { Log.Write(ex); p = new PingState(); }
+                    try { p = net.Sample(); } catch (Exception ex) { Log.Write(ex); p = new PingState(); }
                     Post(() => { lastPing = p; Refresh(); });
                 }
-                Thread.Sleep(5000);
+                Thread.Sleep(10000);
             }
         }
 
@@ -615,11 +655,15 @@ namespace NetSpeed
                 g.Clear(Color.Transparent);
                 g.SmoothingMode = SmoothingMode.AntiAlias;
                 g.TextRenderingHint = TextRenderingHint.AntiAliasGridFit;
-                using (var bg = new SolidBrush(bgColor))
-                using (var path = Rounded(new RectangleF(0, 0, s, s), s * 0.18f))
+                using (var bg = new SolidBrush(Color.FromArgb(250, 250, 250)))
+                using (var border = new Pen(bgColor, Math.Max(1f, s / 16f)))
+                using (var path = Rounded(new RectangleF(0.5f, 0.5f, s - 1.5f, s - 1.5f), s * 0.18f))
+                {
                     g.FillPath(bg, path);
-                DrawFit(g, top, Color.White, new RectangleF(0, 0, s, s / 2f), s);
-                DrawFit(g, bottom, Color.White, new RectangleF(0, s / 2f, s, s / 2f), s);
+                    g.DrawPath(border, path);
+                }
+                DrawFit(g, top, bgColor, new RectangleF(0, 0, s, s / 2f), s);
+                DrawFit(g, bottom, bgColor, new RectangleF(0, s / 2f, s, s / 2f), s);
                 IntPtr h = bmp.GetHicon();
                 var ic = (Icon)Icon.FromHandle(h).Clone();
                 Native.DestroyIcon(h);
@@ -675,7 +719,7 @@ namespace NetSpeed
         string line1 = "Speed: …", line2 = "Ping: …", line3 = "";
         Color statusColor = Color.Gray;
         readonly Font font = new Font("Segoe UI", 9f, FontStyle.Bold);
-        readonly Font small = new Font("Segoe UI", 8f, FontStyle.Regular);
+        readonly Font small = new Font("Segoe UI", 8f, FontStyle.Bold);
 
         public FloatBox(ContextMenuStrip menu)
         {
@@ -683,8 +727,8 @@ namespace NetSpeed
             ShowInTaskbar = false;
             TopMost = true;               // set once only
             StartPosition = FormStartPosition.Manual;
-            BackColor = Color.FromArgb(22, 26, 36);
-            Opacity = 0.92;
+            BackColor = Color.FromArgb(252, 252, 252);
+            Opacity = 0.96;
             DoubleBuffered = true;
             ContextMenuStrip = menu;
             AutoScaleMode = AutoScaleMode.None;
@@ -743,9 +787,11 @@ namespace NetSpeed
             g.TextRenderingHint = TextRenderingHint.ClearTypeGridFit;
             float lh = g.MeasureString("Ag", font).Height;
             using (var bar = new SolidBrush(statusColor))
-            using (var w = new SolidBrush(Color.White))
-            using (var lt = new SolidBrush(Color.FromArgb(200, 210, 225)))
+            using (var w = new SolidBrush(Color.FromArgb(25, 25, 25)))
+            using (var lt = new SolidBrush(Color.FromArgb(60, 64, 72)))
+            using (var edge = new Pen(Color.FromArgb(190, 190, 190)))
             {
+                g.DrawRectangle(edge, 0, 0, ClientSize.Width - 1, ClientSize.Height - 1);
                 g.FillRectangle(bar, 0, 0, 5, ClientSize.Height);
                 g.DrawString(line1, font, w, 9, 3);
                 g.DrawString(line2, font, lt, 9, 3 + lh);

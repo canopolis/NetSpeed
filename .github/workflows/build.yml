@@ -44,6 +44,6 @@ jobs:
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v3.2.${{ github.run_number }}
-          name: NetSpeed v3.2.${{ github.run_number }}
+          tag_name: v3.3.${{ github.run_number }}
+          name: NetSpeed v3.3.${{ github.run_number }}
           files: dist/*
