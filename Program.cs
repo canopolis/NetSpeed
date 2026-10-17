@@ -185,12 +185,15 @@ namespace NetSpeed
         [DllImport("user32.dll")] public static extern bool DestroyIcon(IntPtr h);
         [DllImport("user32.dll")] public static extern bool ReleaseCapture();
         [DllImport("user32.dll")] public static extern IntPtr SendMessage(IntPtr h, int msg, int w, int l);
+        [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+        [DllImport("user32.dll")] public static extern short GetAsyncKeyState(int vKey);
     }
 
     class PingState
     {
         public bool Online;
         public double PingMs, JitterMs, Baseline, BurstMedian;
+        public int Samples;
         public string Raw = "", Mode = "";
     }
 
@@ -217,7 +220,26 @@ namespace NetSpeed
         int burstFails, offline;
         public double LastPing = 30;
         string lastDetail = "";
-        public double KnownDown, KnownUp;          // last results, used to size the next test without a probe
+        readonly List<double> recentDown = new List<double>(), recentUp = new List<double>();   // last 5 results
+        static readonly System.Globalization.CultureInfo IC = System.Globalization.CultureInfo.InvariantCulture;
+
+        public void LoadRecent()
+        {
+            foreach (var pair in new[] { new { k = "RecentDown", l = recentDown }, new { k = "RecentUp", l = recentUp } })
+                foreach (var part in Settings.Get(pair.k, "").Split(new[] { ';' }, StringSplitOptions.RemoveEmptyEntries))
+                {
+                    double v;
+                    if (double.TryParse(part, System.Globalization.NumberStyles.Float, IC, out v) && v > 0) pair.l.Add(v);
+                }
+        }
+
+        static void Remember(List<double> list, string key, double v)
+        {
+            if (v <= 0) return;
+            list.Add(v);
+            while (list.Count > 5) list.RemoveAt(0);
+            Settings.Set(key, string.Join(";", list.Select(x => x.ToString("0.0", IC))));
+        }
         public double Baseline;                    // this connection's normal ping (learned)
         readonly List<double> longHist = new List<double>();
         const double UpTargetSeconds = 0.35;       // upload measured a bit longer for accuracy
@@ -226,7 +248,7 @@ namespace NetSpeed
         {
             ServicePointManager.SecurityProtocol = SecurityProtocolType.Tls12 | (SecurityProtocolType)12288;
             http = new HttpClient { Timeout = TimeSpan.FromSeconds(20) };
-            http.DefaultRequestHeaders.UserAgent.ParseAdd("NetSpeed/3.6");
+            http.DefaultRequestHeaders.UserAgent.ParseAdd("NetSpeed/3.7");
             http.DefaultRequestHeaders.CacheControl = new System.Net.Http.Headers.CacheControlHeaderValue { NoCache = true, NoStore = true };
         }
 
@@ -349,9 +371,11 @@ namespace NetSpeed
             else if (Baseline <= 0) Baseline = med;
             st.Baseline = Baseline;
             st.BurstMedian = med;
+            st.Samples = histP.Count;
             st.Online = true;
-            st.PingMs = LastPing;
-            st.JitterMs = histJ.Average();
+            // Until 3 bursts exist, use the calmest burst so one stray ping can't change the colour.
+            st.PingMs = histP.Count < 3 ? histP.Min() : LastPing;
+            st.JitterMs = histJ.Count < 3 ? histJ.Min() : histJ.Average();
             return st;
         }
 
@@ -416,22 +440,24 @@ namespace NetSpeed
             try
             {
                 long moved;
-                // Size each test from the last result; a small probe is only needed the very first time.
                 var det = new List<string>();
+                // Size from the BEST recent result (not the last one), so a low reading can't shrink the next test.
                 double downEst;
-                if (KnownDown > 0) downEst = KnownDown;
-                else { downEst = Download(MinB, out moved); det.Add("probe " + lastDetail); }
-                double down = Download(SizeFor(downEst), out moved);
+                if (recentDown.Count > 0) downEst = recentDown.Max();
+                else { downEst = Download(1000000, out moved); det.Add("probe " + lastDetail); }
+                // Download must last at least 0.5 s or 10x the ping, whichever is longer (5 MB max).
+                double downSecs = Math.Max(0.5, 10 * LastPing / 1000.0);
+                double down = Download(SizeFor(downEst, downSecs), out moved);
                 det.Add(lastDetail);
                 if (down <= 0) down = downEst;
                 double upEst;
-                if (KnownUp > 0) upEst = KnownUp;
+                if (recentUp.Count > 0) upEst = recentUp.Max();
                 else { upEst = Upload(MinB); det.Add("probe " + lastDetail); }
                 double up = Upload(SizeFor(upEst, UpTargetSeconds));
                 det.Add(lastDetail);
+                Remember(recentDown, "RecentDown", down);
+                Remember(recentUp, "RecentUp", up);
                 r.Detail = string.Join(" | ", det);
-                if (down > 0) KnownDown = down;
-                if (up > 0) KnownUp = up;
                 r.DownMbps = down;
                 r.UpMbps = up;
                 r.Ok = down > 0 && up > 0;
@@ -452,6 +478,7 @@ namespace NetSpeed
         readonly FloatBox box;
         readonly Network net = new Network();
         readonly System.Windows.Forms.Timer scheduler = new System.Windows.Forms.Timer { Interval = 30000 };
+        readonly System.Windows.Forms.Timer closeWatch = new System.Windows.Forms.Timer { Interval = 100 };
         readonly DateTime started = DateTime.Now;
         volatile bool running = true, testing;
         string units;
@@ -468,7 +495,7 @@ namespace NetSpeed
             int iv; intervalMin = int.TryParse(Settings.Get("IntervalMin", "0"), out iv) ? iv : 0;   // automatic tests Off by default
             if (Startup.Enabled) Startup.Set(true);
             lastSpeed = LoadLastSpeed();
-            if (lastSpeed != null && lastSpeed.Ok) { net.KnownDown = lastSpeed.DownMbps; net.KnownUp = lastSpeed.UpMbps; }
+            net.LoadRecent();
             double bp;
             if (double.TryParse(Settings.Get("BaselinePing", ""), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out bp) && bp > 0)
                 net.Baseline = bp;
@@ -550,22 +577,26 @@ namespace NetSpeed
                 testNow, intervalItem, lineData, new ToolStripSeparator(),
                 startItem, floatItem, unitsItem, openLog, new ToolStripSeparator(), exit });
             menu.Opening += (s, e) => { startItem.Checked = Startup.Enabled; UpdateMenuTexts(); };
-            menu.Closed += (s, e) => { if (iconPending) { iconPending = false; UpdateIcon(); } };
+            menu.Closed += (s, e) => { closeWatch.Stop(); if (iconPending) { iconPending = false; UpdateIcon(); } };
+            // Make the menu the active window so Windows closes it on an outside click,
+            // and as a backup watch for clicks outside the menu and its submenus.
+            menu.Opened += (s, e) =>
+            {
+                try { Native.SetForegroundWindow(menu.Handle); } catch { }
+                closeWatch.Start();
+            };
+            closeWatch.Tick += (s, e) =>
+            {
+                if (!menu.Visible) { closeWatch.Stop(); return; }
+                bool down = (Native.GetAsyncKeyState(0x01) & 0x8000) != 0 || (Native.GetAsyncKeyState(0x02) & 0x8000) != 0;
+                if (down && !InsideMenu(Cursor.Position)) menu.Close(ToolStripDropDownCloseReason.AppClicked);
+            };
 
-            tray.ContextMenuStrip = menu;
+            // Right mouse button opens the menu; left button is only for choosing items.
             tray.Text = "NetSpeed";
             tray.Icon = LoadAppIcon();
             tray.Visible = true;
-            tray.MouseClick += (s, e) =>
-            {
-                if (e.Button != MouseButtons.Left) return;
-                try
-                {
-                    var mi = typeof(NotifyIcon).GetMethod("ShowContextMenu", BindingFlags.Instance | BindingFlags.NonPublic);
-                    mi?.Invoke(tray, null);
-                }
-                catch (Exception ex) { Log.Write(ex); }
-            };
+            tray.MouseUp += (s, e) => { if (e.Button == MouseButtons.Right) ShowMenu(); };
 
             box = new FloatBox(menu);
             var handle = box.Handle; // lets the background threads hand results to the screen
@@ -584,6 +615,17 @@ namespace NetSpeed
             scheduler.Tick += (s, e) => CheckSchedule();
             scheduler.Start();
             Refresh();
+        }
+
+        void ShowMenu()
+        {
+            try
+            {
+                Native.SetForegroundWindow(box.Handle);
+                UpdateMenuTexts();
+                menu.Show(Cursor.Position, ToolStripDropDownDirection.AboveLeft);
+            }
+            catch (Exception ex) { Log.Write(ex); }
         }
 
         // ---------- background work ----------
@@ -680,6 +722,7 @@ namespace NetSpeed
         int Level()
         {
             if (!lastPing.Online) return 2;
+            if (lastPing.Samples < 3) return 0;   // still collecting the first readings
             if (Above() > 60 || lastPing.JitterMs > 30) return 2;
             if (Above() > 30 || lastPing.JitterMs >= 10) return 1;
             return 0;
@@ -690,6 +733,7 @@ namespace NetSpeed
         string Reason()
         {
             if (!lastPing.Online) return "offline";
+            if (lastPing.Samples < 3) return "collecting first readings";
             if (Above() > 60) return "ping " + Above().ToString("0") + " ms above normal";
             if (lastPing.JitterMs > 30) return "high jitter";
             if (Above() > 30) return "ping " + Above().ToString("0") + " ms above normal";
@@ -772,6 +816,24 @@ namespace NetSpeed
         {
             using (var s = Assembly.GetExecutingAssembly().GetManifestResourceStream("netspeed.ico"))
                 return s != null ? new Icon(s, SystemInformation.SmallIconSize) : SystemIcons.Application;
+        }
+
+        bool InsideMenu(Point pt)
+        {
+            if (menu.Visible && menu.Bounds.Contains(pt)) return true;
+            return InsideDrop(menu.Items, pt);
+        }
+
+        static bool InsideDrop(ToolStripItemCollection items, Point pt)
+        {
+            foreach (ToolStripItem it in items)
+            {
+                var mi = it as ToolStripMenuItem;
+                if (mi == null || !mi.HasDropDownItems || !mi.DropDown.Visible) continue;
+                if (mi.DropDown.Bounds.Contains(pt)) return true;
+                if (InsideDrop(mi.DropDownItems, pt)) return true;
+            }
+            return false;
         }
 
         void ShowBox()

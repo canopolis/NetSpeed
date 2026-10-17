@@ -9,7 +9,7 @@
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <PlatformTarget>AnyCPU</PlatformTarget>
     <Prefer32Bit>false</Prefer32Bit>
-    <Version>3.6.0</Version>
+    <Version>3.7.0</Version>
     <Product>NetSpeed</Product>
     <Company>Canopolis</Company>
     <Description>Live connection quality and speed in the Windows tray</Description>
