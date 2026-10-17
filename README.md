@@ -7,3 +7,5 @@ Live connection quality and speed in the Windows 10/11 tray.
   Test size adapts to the connection; timing starts when data arrives, so ping does not lower the result.
 - Menu shows the data NetSpeed used this month.
 - Icon: top = last measured download, bottom = live ping (ms). Hover for details.
+- Diagnostic log: %LOCALAPPDATA%\NetSpeed
+etspeed_log.csv (one line per ping burst and speed test; menu > Logs: Open log file, Open log folder, Copy logs to Desktop).

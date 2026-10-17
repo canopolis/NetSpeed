@@ -45,6 +45,67 @@ namespace NetSpeed
                 string dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "NetSpeed");
                 Directory.CreateDirectory(dir);
                 File.AppendAllText(Path.Combine(dir, "error.log"), DateTime.Now + "  " + ex + Environment.NewLine + Environment.NewLine);
+                Diag.Line("error", "", "", "", "", "", "", "", "", "", "", "", (ex?.GetType().Name ?? "") + ": " + (ex?.Message ?? ""));
+            }
+            catch { }
+        }
+    }
+
+    // Diagnostic log: one CSV line per ping burst and per speed test.
+    // %LOCALAPPDATA%\NetSpeed\netspeed_log.csv  (rotates at 5 MB, previous kept as netspeed_log_old.csv)
+    static class Diag
+    {
+        static readonly object gate = new object();
+        public static readonly string Dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "NetSpeed");
+        static readonly string FilePath = Path.Combine(Dir, "netspeed_log.csv");
+        const string Header = "time,type,online,mode,raw_ms,burst_median_ms,ping_avg_ms,jitter_ms,normal_ms,status,reason,down_mbps,up_mbps,details";
+        static readonly System.Globalization.CultureInfo IC = System.Globalization.CultureInfo.InvariantCulture;
+
+        public static string N(double v) => v.ToString("0.0", IC);
+
+        static string Q(string v)
+        {
+            if (v == null) return "";
+            return v.IndexOfAny(new[] { ',', '"', '\n' }) >= 0 ? "\"" + v.Replace("\"", "\"\"") + "\"" : v;
+        }
+
+        // Copies all log files into a new dated folder on the Desktop and returns that folder.
+        public static string CopyToDesktop()
+        {
+            lock (gate)
+            {
+                string desk = Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory);
+                string target = Path.Combine(desk, "NetSpeed logs " + DateTime.Now.ToString("yyyy-MM-dd HHmm", IC));
+                Directory.CreateDirectory(target);
+                int copied = 0;
+                foreach (var name in new[] { "netspeed_log.csv", "netspeed_log_old.csv", "error.log" })
+                {
+                    string src = Path.Combine(Dir, name);
+                    if (File.Exists(src)) { File.Copy(src, Path.Combine(target, name), true); copied++; }
+                }
+                if (copied == 0) File.WriteAllText(Path.Combine(target, "no logs yet.txt"), "NetSpeed has not written any log yet.");
+                return target;
+            }
+        }
+
+        public static void Line(params string[] fields)
+        {
+            try
+            {
+                lock (gate)
+                {
+                    Directory.CreateDirectory(Dir);
+                    var fi = new FileInfo(FilePath);
+                    if (fi.Exists && fi.Length > 5000000)
+                    {
+                        string old = Path.Combine(Dir, "netspeed_log_old.csv");
+                        if (File.Exists(old)) File.Delete(old);
+                        File.Move(FilePath, old);
+                    }
+                    bool isNew = !File.Exists(FilePath);
+                    string line = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss", IC) + "," + string.Join(",", fields.Select(Q));
+                    File.AppendAllText(FilePath, (isNew ? Header + Environment.NewLine : "") + line + Environment.NewLine);
+                }
             }
             catch { }
         }
@@ -129,7 +190,8 @@ namespace NetSpeed
     class PingState
     {
         public bool Online;
-        public double PingMs, JitterMs, Baseline;
+        public double PingMs, JitterMs, Baseline, BurstMedian;
+        public string Raw = "", Mode = "";
     }
 
     class SpeedResult
@@ -138,6 +200,7 @@ namespace NetSpeed
         public double DownMbps, UpMbps;
         public long Bytes;
         public DateTime When;
+        public string Detail = "";
     }
 
     class Network
@@ -153,6 +216,7 @@ namespace NetSpeed
         DateTime httpSince;
         int burstFails, offline;
         public double LastPing = 30;
+        string lastDetail = "";
         public double KnownDown, KnownUp;          // last results, used to size the next test without a probe
         public double Baseline;                    // this connection's normal ping (learned)
         readonly List<double> longHist = new List<double>();
@@ -162,7 +226,7 @@ namespace NetSpeed
         {
             ServicePointManager.SecurityProtocol = SecurityProtocolType.Tls12 | (SecurityProtocolType)12288;
             http = new HttpClient { Timeout = TimeSpan.FromSeconds(20) };
-            http.DefaultRequestHeaders.UserAgent.ParseAdd("NetSpeed/3.4");
+            http.DefaultRequestHeaders.UserAgent.ParseAdd("NetSpeed/3.6");
             http.DefaultRequestHeaders.CacheControl = new System.Net.Http.Headers.CacheControlHeaderValue { NoCache = true, NoStore = true };
         }
 
@@ -243,6 +307,8 @@ namespace NetSpeed
             }
 
             var st = new PingState();
+            st.Mode = httpMode ? "web" : "icmp";
+            st.Raw = got.Count == 0 ? "no reply" : string.Join(" ", got.Select(x => x.ToString("0", System.Globalization.CultureInfo.InvariantCulture)));
             if (got.Count == 0)
             {
                 offline++;
@@ -282,6 +348,7 @@ namespace NetSpeed
             }
             else if (Baseline <= 0) Baseline = med;
             st.Baseline = Baseline;
+            st.BurstMedian = med;
             st.Online = true;
             st.PingMs = LastPing;
             st.JitterMs = histJ.Average();
@@ -309,6 +376,7 @@ namespace NetSpeed
                     }
                     DataUse.Add(moved);
                     double sec = sw == null ? 0 : sw.Elapsed.TotalSeconds;
+                    lastDetail = "down req " + size + " B, got " + moved + " B, timed " + after + " B in " + (sec * 1000).ToString("0") + " ms";
                     if (after <= 0 || sec <= 0.001) return -1;
                     return after * 8 / sec / 1e6;
                 }
@@ -330,6 +398,7 @@ namespace NetSpeed
             DataUse.Add(size);
             double ms = sw.Elapsed.TotalMilliseconds;
             double eff = Math.Max(ms - LastPing / 2, ms * 0.7);
+            lastDetail = "up " + size + " B in " + ms.ToString("0") + " ms (ping " + LastPing.ToString("0") + ", counted " + eff.ToString("0") + " ms)";
             return size * 8 / (eff / 1000) / 1e6;
         }
 
@@ -348,18 +417,26 @@ namespace NetSpeed
             {
                 long moved;
                 // Size each test from the last result; a small probe is only needed the very first time.
-                double downEst = KnownDown > 0 ? KnownDown : Download(MinB, out moved);
+                var det = new List<string>();
+                double downEst;
+                if (KnownDown > 0) downEst = KnownDown;
+                else { downEst = Download(MinB, out moved); det.Add("probe " + lastDetail); }
                 double down = Download(SizeFor(downEst), out moved);
+                det.Add(lastDetail);
                 if (down <= 0) down = downEst;
-                double upEst = KnownUp > 0 ? KnownUp : Upload(MinB);
+                double upEst;
+                if (KnownUp > 0) upEst = KnownUp;
+                else { upEst = Upload(MinB); det.Add("probe " + lastDetail); }
                 double up = Upload(SizeFor(upEst, UpTargetSeconds));
+                det.Add(lastDetail);
+                r.Detail = string.Join(" | ", det);
                 if (down > 0) KnownDown = down;
                 if (up > 0) KnownUp = up;
                 r.DownMbps = down;
                 r.UpMbps = up;
                 r.Ok = down > 0 && up > 0;
             }
-            catch (Exception ex) { Log.Write(ex); r.Ok = false; }
+            catch (Exception ex) { Log.Write(ex); r.Ok = false; r.Detail = "failed: " + ex.Message; }
             r.Bytes = Math.Max(0, DataUse.ThisMonth - before);
             return r;
         }
@@ -433,11 +510,45 @@ namespace NetSpeed
             }
             var exit = new ToolStripMenuItem("Exit");
             exit.Click += (s, e) => Quit();
+            var openLog = new ToolStripMenuItem("Logs");
+            var openFolder = new ToolStripMenuItem("Open log folder");
+            openFolder.Click += (s, e) =>
+            {
+                try { Directory.CreateDirectory(Diag.Dir); Process.Start("explorer.exe", "\"" + Diag.Dir + "\""); }
+                catch (Exception ex) { Log.Write(ex); }
+            };
+            var openCsv = new ToolStripMenuItem("Open log file");
+            openCsv.Click += (s, e) =>
+            {
+                try
+                {
+                    string f = Path.Combine(Diag.Dir, "netspeed_log.csv");
+                    if (File.Exists(f)) Process.Start(new ProcessStartInfo(f) { UseShellExecute = true });
+                    else tray.ShowBalloonTip(4000, "NetSpeed", "No log yet.", ToolTipIcon.Info);
+                }
+                catch (Exception ex) { Log.Write(ex); }
+            };
+            var copyLogs = new ToolStripMenuItem("Copy logs to Desktop");
+            copyLogs.Click += (s, e) =>
+            {
+                try
+                {
+                    string target = Diag.CopyToDesktop();
+                    Process.Start("explorer.exe", "\"" + target + "\"");
+                    tray.ShowBalloonTip(5000, "NetSpeed", "Logs copied to Desktop:\n" + Path.GetFileName(target), ToolTipIcon.Info);
+                }
+                catch (Exception ex)
+                {
+                    Log.Write(ex);
+                    tray.ShowBalloonTip(5000, "NetSpeed", "Could not copy logs: " + ex.Message, ToolTipIcon.Warning);
+                }
+            };
+            openLog.DropDownItems.AddRange(new ToolStripItem[] { openCsv, openFolder, copyLogs });
 
             menu.Items.AddRange(new ToolStripItem[] {
                 lineSpeed, linePing, lineStatus, new ToolStripSeparator(),
                 testNow, intervalItem, lineData, new ToolStripSeparator(),
-                startItem, floatItem, unitsItem, new ToolStripSeparator(), exit });
+                startItem, floatItem, unitsItem, openLog, new ToolStripSeparator(), exit });
             menu.Opening += (s, e) => { startItem.Checked = Startup.Enabled; UpdateMenuTexts(); };
             menu.Closed += (s, e) => { if (iconPending) { iconPending = false; UpdateIcon(); } };
 
@@ -468,6 +579,7 @@ namespace NetSpeed
                     ToolTipIcon.Info);
             }
 
+            Diag.Line("start", "", "", "", "", "", "", "", "", "", "", "", "NetSpeed " + Application.ProductVersion + " on " + Environment.OSVersion.VersionString);
             new Thread(PingLoop) { IsBackground = true, Name = "NetSpeed ping" }.Start();
             scheduler.Tick += (s, e) => CheckSchedule();
             scheduler.Start();
@@ -484,7 +596,13 @@ namespace NetSpeed
                 {
                     PingState p;
                     try { p = net.Sample(); } catch (Exception ex) { Log.Write(ex); p = new PingState(); }
-                    Post(() => { lastPing = p; Refresh(); });
+                    Post(() =>
+                    {
+                        lastPing = p; Refresh();
+                        int l = Level();
+                        Diag.Line("ping", p.Online ? "yes" : "no", p.Mode, p.Raw, Diag.N(p.BurstMedian), Diag.N(p.PingMs),
+                                  Diag.N(p.JitterMs), Diag.N(Normal()), LevelName(l), Reason(), "", "", "");
+                    });
                 }
                 Thread.Sleep(10000);
             }
@@ -510,6 +628,9 @@ namespace NetSpeed
                 try { r = net.SpeedTest(); } catch (Exception ex) { Log.Write(ex); r = new SpeedResult { When = DateTime.Now }; }
                 Post(() =>
                 {
+                    Diag.Line("speedtest", r.Ok ? "yes" : "no", "", "", "", "", "", "", r.Ok ? "ok" : "failed", "",
+                              r.Ok ? Diag.N(r.DownMbps) : "", r.Ok ? Diag.N(r.UpMbps) : "",
+                              r.Detail + " | total " + r.Bytes + " B");
                     testing = false;
                     if (r.Ok) { lastSpeed = r; SaveLastSpeed(r); }
                     else if (lastSpeed == null || DateTime.Now - lastSpeed.When > TimeSpan.FromMinutes(intervalMin > 0 ? intervalMin : 60))
